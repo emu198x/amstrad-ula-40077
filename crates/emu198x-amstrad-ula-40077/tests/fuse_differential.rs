@@ -26,10 +26,10 @@
 //!   24/128/24/52 horizontal (228 per line), 48/192/48/23 vertical (311
 //!   lines), `top_left_pixel = 14365`.
 
-use amstrad_ula_40077::AmstradGateArray;
-use common_sinclair_zx_spectrum::memory::MemoryBus;
-use common_sinclair_zx_spectrum::timing::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use common_sinclair_zx_spectrum::ula::Ula;
+use emu198x_amstrad_ula_40077::AmstradGateArray;
+use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
+use emu198x_bus_sinclair_zx_spectrum::Ula;
+use emu198x_bus_sinclair_zx_spectrum::timing::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const PER_LINE: u32 = 228;
 const DISPLAY_LINES: u32 = 192;

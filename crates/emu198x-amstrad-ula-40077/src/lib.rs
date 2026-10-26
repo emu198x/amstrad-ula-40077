@@ -14,10 +14,10 @@
 //!
 //! Same crystal and line layout as the 128K (17.734475 MHz, 228 T/line, 311 lines).
 
-use common_sinclair_zx_spectrum::memory::MemoryBus;
-use common_sinclair_zx_spectrum::timing::{self, FrameTiming};
-use common_sinclair_zx_spectrum::ula::Ula;
-use common_sinclair_zx_spectrum::ula_engine::{self, DELAY_TABLE_PLUS2A, UlaEngine};
+use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
+use emu198x_bus_sinclair_zx_spectrum::Ula;
+use emu198x_bus_sinclair_zx_spectrum::timing::{self, FrameTiming};
+use emu198x_sinclair_zx_spectrum_ula::{self as ula_engine, DELAY_TABLE_PLUS2A, UlaEngine};
 
 /// Amstrad 40077 gate array.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -41,8 +41,8 @@ impl AmstradGateArray {
     /// Reinstall the +2A/+3 timing config after a snapshot restore.
     ///
     /// `UlaEngine::config` is `#[serde(skip)]` and falls back to the
-    /// 48K config on deserialise (see `common_sinclair_zx_spectrum::
-    /// ula_engine::default_config`). The Amstrad gate-array uses
+    /// 48K config on deserialise (see `emu198x_sinclair_zx_spectrum_ula::
+    /// default_config`). The Amstrad gate-array uses
     /// CONFIG_PLUS2A — different contention pattern, different line
     /// length. Call once after `restore`.
     pub fn reattach_config(&mut self) {
