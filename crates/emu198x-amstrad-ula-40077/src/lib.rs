@@ -167,4 +167,200 @@ mod tests {
         g.write_fe(0x02); // border = red (0b010)
         assert_eq!(g.border_color(), 2);
     }
+
+    /// Memory whose contention answer the test chooses.
+    struct Memory {
+        contended: bool,
+    }
+
+    impl MemoryBus for Memory {
+        fn read(&self, _addr: u16) -> u8 {
+            0
+        }
+
+        fn write(&mut self, _addr: u16, _value: u8) {}
+
+        fn is_contended(&self, _addr: u16) -> bool {
+            self.contended
+        }
+    }
+
+    const CONTENDED: Memory = Memory { contended: true };
+    const UNCONTENDED: Memory = Memory { contended: false };
+
+    /// Half-cycle ticks in one +2A/+3 frame: 456 pixels by 311 lines.
+    const FRAME_TICKS: usize = 456 * 311;
+
+    /// Tick index (from the start of a frame) on which the interrupt rises:
+    /// line 248, pixel 1 of `CONFIG_PLUS2A`.
+    const INT_RISE_TICK: usize = 248 * 456 + 1;
+
+    fn framebuffer() -> Vec<u8> {
+        vec![0; timing::SCREEN_WIDTH * timing::SCREEN_HEIGHT]
+    }
+
+    /// Tick a whole frame with fixed pins and count the half-cycles on
+    /// which the gate array withholds the CPU clock.
+    fn stalls_over_a_frame(memory: &Memory, addr: u16, mreq: bool, iorq: bool) -> usize {
+        let mut g = AmstradGateArray::new();
+        let mut fb = framebuffer();
+        let mut stalls = 0;
+        for _ in 0..FRAME_TICKS {
+            Ula::tick(&mut g, memory, addr, mreq, iorq, false, &mut fb);
+            if !g.cpu_clock_active() {
+                stalls += 1;
+            }
+        }
+        stalls
+    }
+
+    /// Ticks from now until the interrupt line rises, and how long it stays up.
+    fn interrupt_rise_and_width(g: &mut AmstradGateArray) -> (usize, usize) {
+        let mut fb = framebuffer();
+        let mut rise = None;
+        let mut width = 0;
+        for i in 1..=FRAME_TICKS {
+            Ula::tick(g, &UNCONTENDED, 0, false, false, false, &mut fb);
+            if g.interrupt_active() {
+                rise.get_or_insert(i);
+                width += 1;
+            }
+        }
+        (rise.unwrap_or(0), width)
+    }
+
+    #[test]
+    fn default_is_the_same_as_new() {
+        let g = AmstradGateArray::default();
+        assert_eq!(g.border_color(), 7);
+        assert!(g.cpu_clock_active());
+        assert!(!g.interrupt_active());
+        assert_eq!(g.frame_timing().tstates_per_frame, 70_908);
+    }
+
+    #[test]
+    fn frame_is_two_ticks_per_t_state() {
+        let g = AmstradGateArray::new();
+        assert_eq!(FRAME_TICKS, g.frame_timing().tstates_per_frame as usize * 2);
+    }
+
+    #[test]
+    fn interrupt_pulse_is_32_t_states_on_line_248() {
+        let mut g = AmstradGateArray::new();
+        let (rise, width) = interrupt_rise_and_width(&mut g);
+        assert_eq!(rise, INT_RISE_TICK);
+        // 64 half-cycle ticks is 32 T-states, the ASIC's shorter pulse.
+        assert_eq!(width, 64);
+    }
+
+    #[test]
+    fn reattach_config_restores_plus2a_timing() {
+        let mut g = AmstradGateArray::new();
+        // What a snapshot restore leaves behind: the engine's skipped
+        // config falls back to the 48K one.
+        g.engine.set_config(&ula_engine::CONFIG_48K);
+        g.reattach_config();
+        let (rise, width) = interrupt_rise_and_width(&mut g);
+        assert_eq!(rise, INT_RISE_TICK);
+        assert_eq!(width, 64);
+    }
+
+    #[test]
+    fn end_frame_rewinds_the_beam_and_counts_flash() {
+        let mut g = AmstradGateArray::new();
+        let mut fb = framebuffer();
+        for _ in 0..1_000 {
+            Ula::tick(&mut g, &UNCONTENDED, 0, false, false, false, &mut fb);
+        }
+        assert_ne!((g.engine.scan, g.engine.pixel), (0, 0));
+        g.end_frame();
+        assert_eq!((g.engine.scan, g.engine.pixel), (0, 0));
+        assert_eq!(g.engine.flash_counter, 1);
+        assert!(!g.engine.flash_active);
+
+        // The beam restarts from the top: the interrupt is a full
+        // frame-start distance away again.
+        let (rise, _) = interrupt_rise_and_width(&mut g);
+        assert_eq!(rise, INT_RISE_TICK);
+    }
+
+    #[test]
+    fn flash_turns_on_after_sixteen_frames() {
+        let mut g = AmstradGateArray::new();
+        for _ in 0..15 {
+            g.end_frame();
+        }
+        assert!(!g.engine.flash_active);
+        g.end_frame();
+        assert!(g.engine.flash_active);
+    }
+
+    #[test]
+    fn contended_memory_access_stalls_only_in_the_display_window() {
+        let mut g = AmstradGateArray::new();
+        let mut fb = framebuffer();
+        let mut stalls = 0;
+        for _ in 0..FRAME_TICKS {
+            let phase = (g.engine.pixel as usize) & 0x0F;
+            let scan = g.engine.scan;
+            Ula::tick(&mut g, &CONTENDED, 0x4000, true, false, false, &mut fb);
+            if !g.cpu_clock_active() {
+                stalls += 1;
+                assert!(scan < 192, "stall outside the display lines at {scan}");
+                assert!(DELAY_TABLE_PLUS2A[phase], "stall at phase {phase}");
+            }
+        }
+        assert!(stalls > 0);
+    }
+
+    #[test]
+    fn no_contention_without_mreq() {
+        // Control: the same address and memory do stall once MREQ is up.
+        assert!(stalls_over_a_frame(&CONTENDED, 0x4000, true, false) > 0);
+        assert_eq!(stalls_over_a_frame(&CONTENDED, 0x4000, false, false), 0);
+    }
+
+    #[test]
+    fn io_requests_are_never_contended() {
+        // An even port in the contended range with IORQ asserted: the
+        // Sinclair ULAs would stall here, the gate array does not.
+        assert_eq!(stalls_over_a_frame(&CONTENDED, 0x40FE, false, true), 0);
+    }
+
+    #[test]
+    fn uncontended_addresses_never_stall() {
+        assert_eq!(stalls_over_a_frame(&UNCONTENDED, 0x8000, true, false), 0);
+    }
+
+    #[test]
+    fn read_fe_clears_ear_with_no_keys_down() {
+        let g = AmstradGateArray::new();
+        assert_eq!(g.read_fe(0xFEFE, &[0x1F; 8]), 0xBF);
+    }
+
+    #[test]
+    fn read_fe_keeps_ear_low_whatever_was_written() {
+        let mut g = AmstradGateArray::new();
+        // MIC and EAR bits both set: on a 48K this would raise bit 6.
+        g.write_fe(0x18);
+        assert_eq!(g.read_fe(0xFEFE, &[0x1F; 8]) & 0x40, 0);
+        assert_eq!(g.border_color(), 0);
+    }
+
+    #[test]
+    fn read_fe_reports_keys_on_selected_half_rows() {
+        let g = AmstradGateArray::new();
+        let mut keys = [0x1F; 8];
+        keys[0] = 0x1E; // bit 0 down on half-row 0
+        keys[7] = 0x0F; // bit 4 down on half-row 7
+
+        // $FEFE selects only half-row 0.
+        assert_eq!(g.read_fe(0xFEFE, &keys), 0xBE);
+        // $7FFE selects only half-row 7.
+        assert_eq!(g.read_fe(0x7FFE, &keys), 0xAF);
+        // $00FE selects every half-row, so both keys show.
+        assert_eq!(g.read_fe(0x00FE, &keys), 0xAE);
+        // $FFFE selects none.
+        assert_eq!(g.read_fe(0xFFFE, &keys), 0xBF);
+    }
 }
