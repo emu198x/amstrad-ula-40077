@@ -6,6 +6,7 @@
 //! - Adapted from `../Emu198x-Older/crates/amstrad-ula-40077/src/lib.rs`
 //!
 //! Key differences from the Sinclair ULAs:
+//! - Continuous CPU clock, with an active WAIT output for contention
 //! - Different contention pattern: `[1, 0, 7, 6, 5, 4, 3, 2]`
 //! - **No I/O contention** — the gate array is MREQ-only
 //! - **No internal-op contention** — MREQ is not active during internal cycles
@@ -17,12 +18,20 @@
 use emu198x_bus_sinclair_zx_spectrum::MemoryBus;
 use emu198x_bus_sinclair_zx_spectrum::Ula;
 use emu198x_bus_sinclair_zx_spectrum::timing::{self, FrameTiming};
-use emu198x_sinclair_zx_spectrum_ula::{self as ula_engine, DELAY_TABLE_PLUS2A, UlaEngine};
+use emu198x_sinclair_zx_spectrum_ula::{self as ula_engine, UlaEngine};
+
+// WAIT is released for one T-state in every eight. This differs from the
+// shared engine's Ferranti clock-hold mask; see the Amstrad WAIT plan.
+const WAIT_PATTERN: [bool; 16] = [
+    true, true, false, false, true, true, true, true, true, true, true, true, true, true, true,
+    true,
+];
 
 /// Amstrad 40077 gate array.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AmstradGateArray {
     engine: UlaEngine,
+    wait: bool,
 }
 
 impl AmstradGateArray {
@@ -30,7 +39,18 @@ impl AmstradGateArray {
     pub fn new() -> Self {
         Self {
             engine: UlaEngine::new(&ula_engine::CONFIG_PLUS2A),
+            wait: false,
         }
+    }
+
+    /// Active level of the 40077's physical `/WAIT` output.
+    ///
+    /// Feed this to the CPU's WAIT input before each CPU edge. The 40077
+    /// does not suppress CPU clocks; the Z80 samples WAIT at its specified
+    /// falling edges and ignores it during refresh and internal cycles.
+    #[must_use]
+    pub fn wait_active(&self) -> bool {
+        self.wait
     }
 
     #[must_use]
@@ -74,25 +94,17 @@ impl Ula for AmstradGateArray {
 
         e.tick_rendering(memory, framebuffer, None);
 
-        // Amstrad contention: MREQ-only. No I/O contention, no internal
-        // contention. The gate array contends only when the CPU is mid
-        // memory access (MREQ asserted) and the address is in a
-        // contended range. This is the inverse of the Sinclair model
-        // (which contends when MREQ is *not* yet active to gate the
-        // upcoming clock).
-        if e.video {
-            let contended_addr = memory.is_contended(cpu_addr);
-            let contention = contended_addr && cpu_mreq && e.z80_clock_high;
-            e.cpu_clock = !(contention && DELAY_TABLE_PLUS2A[phase]);
-        } else {
-            e.cpu_clock = true;
-        }
+        // Amstrad's manual specifies WAIT, unlike the Ferranti clock hold.
+        // WAIT may be low while MREQ is a refresh request: the Z80 itself
+        // does not sample it there. Its clock must continue through refresh.
+        self.wait = e.video && memory.is_contended(cpu_addr) && cpu_mreq && WAIT_PATTERN[phase];
+        e.cpu_clock = true;
 
         e.track_z80_clock(cpu_iorq, cpu_mreq, cpu_iorq && (cpu_addr & 1) == 0);
     }
 
     fn cpu_clock_active(&self) -> bool {
-        self.engine.cpu_clock
+        true
     }
 
     fn interrupt_active(&self) -> bool {
@@ -199,15 +211,17 @@ mod tests {
         vec![0; timing::SCREEN_WIDTH * timing::SCREEN_HEIGHT]
     }
 
-    /// Tick a whole frame with fixed pins and count the half-cycles on
-    /// which the gate array withholds the CPU clock.
-    fn stalls_over_a_frame(memory: &Memory, addr: u16, mreq: bool, iorq: bool) -> usize {
+    /// Count physical WAIT output while checking that the clock keeps running.
+    fn waits_over_a_frame(memory: &Memory, addr: u16, mreq: bool, iorq: bool) -> usize {
         let mut g = AmstradGateArray::new();
         let mut fb = framebuffer();
         let mut stalls = 0;
         for _ in 0..FRAME_TICKS {
+            let before_clock = g.engine.z80_clock_high;
             Ula::tick(&mut g, memory, addr, mreq, iorq, false, &mut fb);
-            if !g.cpu_clock_active() {
+            assert_ne!(g.engine.z80_clock_high, before_clock);
+            assert!(g.cpu_clock_active(), "WAIT must not suppress the clock");
+            if g.wait_active() {
                 stalls += 1;
             }
         }
@@ -296,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn contended_memory_access_stalls_only_in_the_display_window() {
+    fn contended_memory_wait_is_asserted_only_in_the_display_window() {
         let mut g = AmstradGateArray::new();
         let mut fb = framebuffer();
         let mut stalls = 0;
@@ -304,32 +318,74 @@ mod tests {
             let phase = (g.engine.pixel as usize) & 0x0F;
             let scan = g.engine.scan;
             Ula::tick(&mut g, &CONTENDED, 0x4000, true, false, false, &mut fb);
-            if !g.cpu_clock_active() {
+            assert!(g.cpu_clock_active(), "WAIT must not suppress the clock");
+            if g.wait_active() {
                 stalls += 1;
                 assert!(scan < 192, "stall outside the display lines at {scan}");
-                assert!(DELAY_TABLE_PLUS2A[phase], "stall at phase {phase}");
+                assert!(WAIT_PATTERN[phase], "stall at phase {phase}");
             }
         }
         assert!(stalls > 0);
     }
 
     #[test]
+    fn falling_edge_arrivals_wait_for_the_next_ram_slot() {
+        // Sample WAIT on consecutive falling edges, not on every half-cycle.
+        // Amstrad allows one RAM slot in eight T-states (manual p. 273).
+        let mut measured = Vec::new();
+        for arrival in 0..8 {
+            let mut g = AmstradGateArray::new();
+            g.engine.scan = 64;
+            g.engine.pixel = 17 + 2 * arrival;
+            g.engine.video = true;
+            let mut fb = framebuffer();
+            let mut waits = 0;
+            loop {
+                Ula::tick(&mut g, &CONTENDED, 0x4000, true, false, false, &mut fb);
+                assert!(g.cpu_clock_active());
+                if !g.wait_active() {
+                    break;
+                }
+                waits += 1;
+                assert!(waits < 8, "no RAM slot within eight T-states");
+                Ula::tick(&mut g, &CONTENDED, 0x4000, true, false, false, &mut fb);
+            }
+            measured.push(waits);
+        }
+        assert_eq!(measured, [1, 0, 7, 6, 5, 4, 3, 2]);
+    }
+
+    #[test]
+    fn refresh_can_assert_wait_without_stopping_the_clock() {
+        let mut g = AmstradGateArray::new();
+        g.engine.scan = 64;
+        g.engine.pixel = 17;
+        g.engine.video = true;
+        let mut fb = framebuffer();
+        let before = g.engine.z80_clock_high;
+        Ula::tick(&mut g, &CONTENDED, 0, true, false, true, &mut fb);
+        assert!(g.wait_active());
+        assert!(g.cpu_clock_active());
+        assert_ne!(g.engine.z80_clock_high, before);
+    }
+
+    #[test]
     fn no_contention_without_mreq() {
         // Control: the same address and memory do stall once MREQ is up.
-        assert!(stalls_over_a_frame(&CONTENDED, 0x4000, true, false) > 0);
-        assert_eq!(stalls_over_a_frame(&CONTENDED, 0x4000, false, false), 0);
+        assert!(waits_over_a_frame(&CONTENDED, 0x4000, true, false) > 0);
+        assert_eq!(waits_over_a_frame(&CONTENDED, 0x4000, false, false), 0);
     }
 
     #[test]
     fn io_requests_are_never_contended() {
         // An even port in the contended range with IORQ asserted: the
         // Sinclair ULAs would stall here, the gate array does not.
-        assert_eq!(stalls_over_a_frame(&CONTENDED, 0x40FE, false, true), 0);
+        assert_eq!(waits_over_a_frame(&CONTENDED, 0x40FE, false, true), 0);
     }
 
     #[test]
     fn uncontended_addresses_never_stall() {
-        assert_eq!(stalls_over_a_frame(&UNCONTENDED, 0x8000, true, false), 0);
+        assert_eq!(waits_over_a_frame(&UNCONTENDED, 0x8000, true, false), 0);
     }
 
     #[test]
