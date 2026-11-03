@@ -9,7 +9,7 @@ git_tag_enable = true
 changelog_update = true
 # Only reader-facing changes earn a release. Release-process work uses `ci:` or
 # `chore(release):`; changelog filtering alone does not prevent a version bump.
-release_commits = "^(feat|fix|perf|revert)[(:]"
+release_commits = "^(feat|fix|perf|revert)[(:!]"
 # Package-prefixed tags, so a second crate here stays unambiguous.
 git_tag_name = "{{ package }}-v{{ version }}"
 
